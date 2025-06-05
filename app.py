@@ -2,9 +2,9 @@ from fastapi import FastAPI, HTTPException, Form, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 import anthropic
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pydantic import BaseModel
 import uvicorn
 from twilio.twiml.messaging_response import MessagingResponse
@@ -15,9 +15,13 @@ from dotenv import load_dotenv
 from twilio.rest import Client
 import requests
 import re
+from bs4 import BeautifulSoup
+import json
+import asyncio
+from urllib.parse import urljoin, urlparse
 
 load_dotenv()
-HISTORY_LIMIT = 10
+HISTORY_LIMIT = 15
 
 class MessageHistory(BaseModel):
     user_id: str
@@ -25,15 +29,39 @@ class MessageHistory(BaseModel):
     timestamp: datetime
     is_user: bool
 
-class JournalEntry(BaseModel):
+class CustomerPreference(BaseModel):
     user_id: str
-    entry_text: str
-    entry_date: datetime = None
-    ai_feedback: Optional[str] = None
+    phone_number: str
+    preferred_makes: List[str] = []
+    preferred_models: List[str] = []
+    max_budget: Optional[int] = None
+    min_year: Optional[int] = None
+    fuel_type: Optional[str] = None
+    transmission: Optional[str] = None
+    body_type: Optional[str] = None
+    max_mileage: Optional[int] = None
+    created_at: datetime = None
+    updated_at: datetime = None
 
-class UserPlan(BaseModel):
-    user_id: str
-    future_authoring_plan: str
+class CarListing(BaseModel):
+    listing_id: str
+    make: str
+    model: str
+    year: int
+    price: int
+    mileage: int
+    fuel_type: str
+    transmission: str
+    body_type: str
+    color: str
+    nct_expiry: Optional[str] = None
+    tax_expiry: Optional[str] = None
+    previous_owners: Optional[int] = None
+    description: str
+    images: List[str] = []
+    url: str
+    scraped_at: datetime
+    available: bool = True
 
 app = FastAPI()
 
@@ -53,10 +81,11 @@ if missing_vars:
 try:
     MONGO_URI = os.getenv('MONGO_URI')
     mongo_client = AsyncIOMotorClient(MONGO_URI)
-    db = mongo_client["myjournal"]
-    journal_entries = db["JournalEntries"]
-    user_collection = db["Users"]
+    db = mongo_client["brendan_conlon_autos"]
     message_history = db["MessageHistory"]
+    customer_preferences = db["CustomerPreferences"]
+    car_listings = db["CarListings"]
+    customer_interactions = db["CustomerInteractions"]
 except Exception as e:
     raise
 
@@ -66,20 +95,147 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
+# Website scraping functions
+async def scrape_brendan_conlon_inventory():
+    """Scrape the Brendan Conlon Automobiles website for current inventory"""
+    try:
+        base_url = "https://www.brendanconlanautomobiles.net"
+        
+        # Headers to mimic a real browser
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        # Get the main inventory page
+        response = requests.get(f"{base_url}/used-cars", headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        cars = []
+        
+        # Extract car listings (this will need to be customized based on actual website structure)
+        car_elements = soup.find_all('div', class_=['car-listing', 'vehicle-item', 'car-card'])
+        
+        for car_element in car_elements:
+            try:
+                car_data = extract_car_details(car_element, base_url)
+                if car_data:
+                    cars.append(car_data)
+            except Exception as e:
+                print(f"Error extracting car details: {e}")
+                continue
+        
+        # Update database with fresh inventory
+        await update_inventory_database(cars)
+        return cars
+        
+    except Exception as e:
+        print(f"Error scraping inventory: {e}")
+        return []
+
+def extract_car_details(car_element, base_url):
+    """Extract details from a single car listing element"""
+    try:
+        # This function will need to be customized based on the actual website structure
+        # Here's a generic template that can be adapted
+        
+        car_data = {}
+        
+        # Extract basic info (customize selectors based on actual website)
+        title = car_element.find(['h2', 'h3', '.car-title', '.vehicle-title'])
+        if title:
+            title_text = title.get_text(strip=True)
+            # Parse title like "2019 BMW 3 Series 320d"
+            parts = title_text.split()
+            if len(parts) >= 3:
+                car_data['year'] = int(parts[0]) if parts[0].isdigit() else None
+                car_data['make'] = parts[1]
+                car_data['model'] = ' '.join(parts[2:])
+        
+        # Extract price
+        price_element = car_element.find(['.price', '.car-price', '.vehicle-price'])
+        if price_element:
+            price_text = re.sub(r'[^\d]', '', price_element.get_text())
+            car_data['price'] = int(price_text) if price_text else None
+        
+        # Extract mileage
+        mileage_element = car_element.find(['.mileage', '.odometer'])
+        if mileage_element:
+            mileage_text = re.sub(r'[^\d]', '', mileage_element.get_text())
+            car_data['mileage'] = int(mileage_text) if mileage_text else None
+        
+        # Extract fuel type
+        fuel_element = car_element.find(['.fuel', '.fuel-type'])
+        if fuel_element:
+            car_data['fuel_type'] = fuel_element.get_text(strip=True)
+        
+        # Extract transmission
+        trans_element = car_element.find(['.transmission', '.gearbox'])
+        if trans_element:
+            car_data['transmission'] = trans_element.get_text(strip=True)
+        
+        # Extract car URL
+        link_element = car_element.find('a')
+        if link_element and link_element.get('href'):
+            car_data['url'] = urljoin(base_url, link_element.get('href'))
+            car_data['listing_id'] = car_data['url'].split('/')[-1]
+        
+        # Extract images
+        img_elements = car_element.find_all('img')
+        car_data['images'] = [urljoin(base_url, img.get('src')) for img in img_elements if img.get('src')]
+        
+        car_data['scraped_at'] = datetime.utcnow()
+        car_data['available'] = True
+        
+        return car_data
+        
+    except Exception as e:
+        print(f"Error extracting car details: {e}")
+        return None
+
+async def update_inventory_database(cars):
+    """Update the database with scraped car inventory"""
+    try:
+        # Mark all existing cars as potentially unavailable
+        await car_listings.update_many({}, {"$set": {"available": False}})
+        
+        for car_data in cars:
+            if car_data.get('listing_id'):
+                # Update or insert car listing
+                await car_listings.update_one(
+                    {"listing_id": car_data['listing_id']},
+                    {"$set": {**car_data, "available": True}},
+                    upsert=True
+                )
+        
+        print(f"Updated inventory with {len(cars)} cars")
+        
+    except Exception as e:
+        print(f"Error updating inventory database: {e}")
+
 def transcribe_voice_note(user_id: str, media_url: str) -> str:
-    auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    response = requests.get(media_url, auth=auth)
-    if response.status_code != 200:
-        return "Failed to download audio."
-    audio_data = response.content
-    transcribe_url = "https://api.deepgram.com/v1/listen"
-    headers = {"Authorization": f"Token {os.getenv('DEEPGRAM_API_KEY')}"}
-    files = {"audio": ("voice.ogg", audio_data, "audio/ogg")}
-    transcription_response = requests.post(transcribe_url, headers=headers, files=files)
-    if transcription_response.status_code != 200:
+    """Transcribe voice messages using Deepgram"""
+    try:
+        auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        response = requests.get(media_url, auth=auth)
+        if response.status_code != 200:
+            return "Failed to download audio."
+        
+        audio_data = response.content
+        transcribe_url = "https://api.deepgram.com/v1/listen"
+        headers = {"Authorization": f"Token {os.getenv('DEEPGRAM_API_KEY')}"}
+        files = {"audio": ("voice.ogg", audio_data, "audio/ogg")}
+        
+        transcription_response = requests.post(transcribe_url, headers=headers, files=files)
+        if transcription_response.status_code != 200:
+            return "Failed to transcribe audio."
+        
+        transcription = transcription_response.json().get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript", "")
+        return transcription if transcription else "Transcription failed."
+        
+    except Exception as e:
+        print(f"Error transcribing voice note: {e}")
         return "Failed to transcribe audio."
-    transcription = transcription_response.json().get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript", "")
-    return transcription if transcription else "Transcription failed."
 
 async def get_message_history(user_id: str, limit: int = HISTORY_LIMIT) -> List[dict]:
     cursor = message_history.find({"user_id": user_id}).sort("timestamp", -1).limit(limit)
@@ -95,123 +251,190 @@ async def add_to_message_history(user_id: str, message: str, is_user: bool):
     )
     await message_history.insert_one(new_message.dict())
 
-async def get_ai_feedback(journal_text: str, life_plan: Optional[str] = None, user_id: str = None, start_time: Optional[float] = None) -> str:
-    """
-    Get AI feedback on pet care using Anthropic's Claude as Dr. Bob, Blue Pet Co ambassador.
-    """
+async def get_customer_preferences(user_id: str) -> Optional[dict]:
+    """Get stored customer preferences"""
+    prefs = await customer_preferences.find_one({"user_id": user_id})
+    return prefs
+
+async def update_customer_preferences(user_id: str, phone_number: str, preferences: dict):
+    """Update customer preferences based on conversation"""
+    await customer_preferences.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "phone_number": phone_number,
+            "updated_at": datetime.utcnow(),
+            **preferences
+        }},
+        upsert=True
+    )
+
+async def search_inventory(preferences: dict = None, query: str = None) -> List[dict]:
+    """Search current inventory based on preferences or query"""
     try:
-        # Get conversation history to provide context
+        search_filter = {"available": True}
+        
+        if preferences:
+            if preferences.get('max_budget'):
+                search_filter['price'] = {"$lte": preferences['max_budget']}
+            if preferences.get('min_year'):
+                search_filter['year'] = {"$gte": preferences['min_year']}
+            if preferences.get('preferred_makes'):
+                search_filter['make'] = {"$in": [make.lower() for make in preferences['preferred_makes']]}
+            if preferences.get('fuel_type'):
+                search_filter['fuel_type'] = {"$regex": preferences['fuel_type'], "$options": "i"}
+            if preferences.get('max_mileage'):
+                search_filter['mileage'] = {"$lte": preferences['max_mileage']}
+        
+        cursor = car_listings.find(search_filter).sort("price", 1).limit(10)
+        cars = await cursor.to_list(length=10)
+        return cars
+        
+    except Exception as e:
+        print(f"Error searching inventory: {e}")
+        return []
+
+async def get_car_by_id(listing_id: str) -> Optional[dict]:
+    """Get specific car details by listing ID"""
+    return await car_listings.find_one({"listing_id": listing_id, "available": True})
+
+async def get_sean_response(message: str, user_id: str, phone_number: str, start_time: Optional[float] = None) -> str:
+    """Generate Sean's response using Claude"""
+    try:
+        # Get conversation history and customer preferences
         history = await get_message_history(user_id, limit=HISTORY_LIMIT)
+        customer_prefs = await get_customer_preferences(user_id)
         
         # Check if this is the first interaction
         is_first_interaction = len([msg for msg in history if not msg['is_user']]) == 0
         
-        system_prompt = """You are Dr. Bob, a world-renowned veterinary surgeon and passionate ambassador for Blue Pet Co (BPC). You create sustainable, marine-powered dog supplements from hand-harvested Irish seaweed. You're an expert in canine health with decades of clinical experience, and you genuinely love dogs and their wellbeing.
+        # Search current inventory based on message content
+        current_inventory = await search_inventory()
+        
+        system_prompt = """You are Sean, a friendly and knowledgeable car salesperson at Brendan Conlon Automobiles in Ireland. You're passionate about helping customers find their perfect car and you know the Irish car market inside and out.
 
 CRITICAL INSTRUCTION - GREETING BEHAVIOR:
-- ONLY introduce yourself as "Dr. Bob" in your very FIRST response to a new user
-- In ALL subsequent responses, NEVER reintroduce yourself or say "Dr. Bob here" or "I'm Dr. Bob"
+- ONLY introduce yourself as "Sean" in your very FIRST response to a new customer
+- In ALL subsequent responses, NEVER reintroduce yourself or say "Sean here" or "I'm Sean"
 - Continue conversations naturally without any self-introduction
 - You are already established in the conversation after the first message
 
 YOUR EXPERTISE & PERSONALITY:
-- Veterinary surgeon with 20+ years of clinical experience
-- Specializes in: joint health, skin & coat conditions, dental care, nutrition, behavioral issues, preventive medicine
-- Passionate about evidence-based veterinary medicine
-- Warm, approachable, and genuinely caring
-- Curious and thorough - you love understanding the full picture
-- Patient and educational - you explain complex topics simply
-- Optimistic but realistic about treatment outcomes
+- Expert in Irish car market, NCT requirements, motor tax, and import regulations
+- 15+ years selling quality used cars in Ireland
+- Honest, straightforward, and genuinely wants to help customers
+- Knows about financing options, trade-ins, and warranties
+- Understands Irish driving needs: city driving, country roads, family requirements
+- Patient and educational - explains car features and Irish regulations clearly
 
 YOUR COMMUNICATION STYLE:
-- Conversational and engaging, like talking to a trusted friend
-- Ask thoughtful follow-up questions to gather complete information
-- Share relevant clinical experience and anecdotes when helpful
-- Use simple, clear language - avoid veterinary jargon unless necessary
-- Adapt your response length based on the complexity of the question
-- Always maintain a supportive, non-judgmental tone
-- Express genuine care and concern for both dog and owner
+- Warm, friendly Irish approach - use "brilliant", "fair play", "no bother"
+- Ask specific questions to understand customer needs
+- Always be honest about car condition and history
+- Use WhatsApp-friendly short messages (under 400 characters)
+- Make customers feel comfortable and informed
 
-DIAGNOSTIC APPROACH:
-When addressing health concerns, systematically gather:
-1. Dog basics: breed, age, weight, sex (neutered/spayed?)
-2. Specific symptoms: onset, duration, severity, progression
-3. Behavioral changes: eating, drinking, energy, mood
-4. Environmental factors: recent changes, new foods, stress
-5. Medical history: current medications, previous conditions
-6. Current care routine: diet, exercise, grooming
+IRISH CAR KNOWLEDGE:
+- NCT (National Car Test) requirements and timing
+- Motor tax bands and costs
+- Import regulations and VRT
+- Common issues with popular car models in Ireland
+- Financing options available through local credit unions and banks
+- Trade-in valuations and process
+- Warranty options and after-sales service
 
-AREAS OF EXPERTISE:
-- Joint Health: arthritis, hip dysplasia, mobility issues, exercise recommendations
-- Skin & Coat: allergies, hot spots, dry skin, seasonal issues, grooming tips
-- Dental Care: tartar, bad breath, tooth pain, dental hygiene routines
-- Nutrition: age-appropriate diets, weight management, food sensitivities
-- Behavioral Health: anxiety, aggression, training support, environmental enrichment
-- Preventive Care: vaccination schedules, parasite prevention, wellness checkups
-- Senior Care: age-related changes, comfort measures, quality of life
+CUSTOMER NEEDS ASSESSMENT:
+Always try to understand:
+1. Budget range and financing needs
+2. Primary use (family, commuting, city/country driving)
+3. Fuel preferences (petrol/diesel considering Irish fuel costs)
+4. Size requirements (parking, family size)
+5. Age/mileage preferences
+6. NCT and tax status importance
+7. Previous car experience and trade-in potential
+
+BRENDAN CONLON AUTOMOBILES EXPERTISE:
+- Quality used cars with full history checks
+- Comprehensive pre-sale inspections
+- Competitive trade-in valuations
+- Flexible viewing appointments including evenings/weekends
+- After-sales support and warranty options
+- Financing assistance and advice
+
+INVENTORY KNOWLEDGE:
+- Know current stock levels and can match customer preferences
+- Understand which cars are best value for money
+- Can explain why certain cars are priced as they are
+- Alert customers to new arrivals that match their interests
+- Honest about any known issues or upcoming maintenance
 
 RESPONSE GUIDELINES:
-- Keep responses between 100-400 characters for WhatsApp format
-- Break longer explanations into multiple shorter messages when needed
-- Always end with an engaging question or invitation for more information
-- Focus on actionable advice while being appropriately cautious
-- Only suggest emergency vet visits for genuine emergencies
-- Encourage regular vet checkups as part of routine care, not as dismissal
+- Keep responses conversational and helpful
+- Always end with a question or call to action
+- Be specific about car details when discussing inventory
+- Mention viewing appointments readily available
+- Focus on value and suitability for Irish driving conditions
+- Never oversell - be honest about pros and cons
 
-BLUE PET CO INTEGRATION:
-- You represent BPC but never push sales - assume they're already customers
-- Mention how marine-based supplements support overall health when relevant
-- Focus on education about the benefits of natural, sustainable pet care
-- Share insights about how nutrition impacts the conditions you're discussing
+EMERGENCY/URGENT RESPONSES:
+- Immediate viewing requests: "No problem, I can arrange that"
+- Financing questions: Offer to discuss options
+- Trade-in valuations: Invite them to bring car for assessment
+- Technical questions: Provide honest, knowledgeable answers
 
-CONVERSATION FLOW:
-- Build on previous exchanges naturally
-- Reference earlier information the owner shared
-- Show you're listening and remembering details
-- Create a sense of ongoing partnership in their dog's care
-- Express genuine interest in updates and progress
-
-EMERGENCY PROTOCOLS:
-Only suggest immediate veterinary attention for:
-- Difficulty breathing or choking
-- Suspected poisoning or toxin ingestion
-- Severe trauma or bleeding
-- Signs of bloat (distended abdomen, retching without vomiting)
-- Seizures, collapse, or loss of consciousness
-- Extreme lethargy with other concerning symptoms
-
-For all other concerns, provide guidance while encouraging routine veterinary care as part of responsible ownership."""
+SALES APPROACH:
+- Build relationships, not just transactions
+- Focus on finding the RIGHT car for each customer
+- Be transparent about all costs (NCT, tax, insurance implications)
+- Offer test drives and thorough inspections
+- Follow up appropriately without being pushy"""
 
         # Build conversation context
         conversation_context = ""
         if history:
             conversation_context = "\nCONVERSATION HISTORY:\n"
-            for msg in history[-6:]:  # Last 6 messages for context
-                role = "Owner" if msg['is_user'] else "Dr. Bob"
+            for msg in history[-8:]:  # Last 8 messages for context
+                role = "Customer" if msg['is_user'] else "Sean"
                 conversation_context += f"{role}: {msg['message']}\n"
             conversation_context += "\n"
 
+        # Add customer preferences context
+        prefs_context = ""
+        if customer_prefs:
+            prefs_context = f"\nCUSTOMER PREFERENCES:\n"
+            if customer_prefs.get('preferred_makes'):
+                prefs_context += f"Preferred makes: {', '.join(customer_prefs['preferred_makes'])}\n"
+            if customer_prefs.get('max_budget'):
+                prefs_context += f"Budget: Up to €{customer_prefs['max_budget']:,}\n"
+            if customer_prefs.get('fuel_type'):
+                prefs_context += f"Fuel preference: {customer_prefs['fuel_type']}\n"
+
+        # Add current inventory context
+        inventory_context = "\nCURRENT INVENTORY SAMPLE:\n"
+        for car in current_inventory[:5]:  # Show top 5 cars
+            inventory_context += f"- {car.get('year')} {car.get('make')} {car.get('model')}: €{car.get('price', 0):,}, {car.get('mileage', 0):,}km\n"
+
         # Create user prompt with context
         if is_first_interaction:
-            user_prompt = f"""This is your FIRST interaction with this dog owner. Introduce yourself warmly as Dr. Bob and ask for basic information about their dog and concern.
+            user_prompt = f"""This is your FIRST interaction with this customer. Introduce yourself warmly as Sean from Brendan Conlon Automobiles and ask what kind of car they're looking for.
 
-Owner's message: {journal_text}
+Customer's message: {message}
 
-Respond in under 400 characters with a warm introduction and relevant questions."""
+Respond in under 400 characters with a warm Irish welcome and relevant questions about their car needs."""
         else:
-            user_prompt = f"""{conversation_context}
-The owner has sent a new message. Continue the conversation naturally WITHOUT reintroducing yourself. Build on the previous context and provide helpful guidance.
+            user_prompt = f"""{conversation_context}{prefs_context}{inventory_context}
 
-Owner's latest message: {journal_text}
+The customer has sent a new message. Continue the conversation naturally WITHOUT reintroducing yourself. Help them find their perfect car using your knowledge and current inventory.
 
-Respond in under 400 characters, continuing the established conversation."""
+Customer's latest message: {message}
+
+Respond in under 400 characters, being helpful and specific about cars or next steps."""
 
         messages = [{"role": "user", "content": user_prompt}]
 
         response = await anthropic_client.messages.create(
             model="claude-3-5-sonnet-latest",
-            max_tokens=200,  # Reduced for shorter responses
-            temperature=0.3,  # Lower temperature for more consistent behavior
+            max_tokens=200,
+            temperature=0.3,
             system=system_prompt,
             messages=messages,
             stream=False
@@ -220,21 +443,62 @@ Respond in under 400 characters, continuing the established conversation."""
         if start_time:
             print(f"Claude API response time: {time.time() - start_time} seconds")
 
-        print(f"[INFO] Dr. Bob response => {response}")
+        print(f"[INFO] Sean response => {response}")
         ai_response = response.content[0].text.strip()
         
         # Additional safeguard - remove any accidental reintroductions
         if not is_first_interaction:
-            # Remove common reintroduction patterns
-            ai_response = re.sub(r'^(Hi there!?\s*)?(I\'m\s+)?Dr\.?\s*Bob\s*(here[,\s]*)?', '', ai_response, flags=re.IGNORECASE)
-            ai_response = re.sub(r'^(Hello!?\s*)?(This is\s+)?Dr\.?\s*Bob[,\s]*', '', ai_response, flags=re.IGNORECASE)
+            ai_response = re.sub(r'^(Hi there!?\s*)?(I\'m\s+)?Sean\s*(here[,\s]*)?', '', ai_response, flags=re.IGNORECASE)
+            ai_response = re.sub(r'^(Hello!?\s*)?(This is\s+)?Sean[,\s]*', '', ai_response, flags=re.IGNORECASE)
             ai_response = ai_response.strip()
         
-        return ai_response[:400]  # Ensure character limit
+        # Extract and update customer preferences from the conversation
+        await extract_and_save_preferences(message, user_id, phone_number)
+        
+        return ai_response[:400]
         
     except Exception as e:
-        print(f"Error generating veterinary AI response: {e}")
-        return "Sorry, I'm unable to help at the moment. Please try again."
+        print(f"Error generating Sean's response: {e}")
+        return "Sorry, I'm having a technical issue. Can you try again in a moment?"
+
+async def extract_and_save_preferences(message: str, user_id: str, phone_number: str):
+    """Extract customer preferences from their message and save them"""
+    try:
+        message_lower = message.lower()
+        preferences = {}
+        
+        # Extract budget
+        budget_match = re.search(r'(?:under|up\s+to|max|budget|around)\s*€?(\d{1,2}[,\d]*)', message_lower)
+        if budget_match:
+            budget_str = budget_match.group(1).replace(',', '')
+            preferences['max_budget'] = int(budget_str) * 1000  # Assume thousands
+        
+        # Extract year preferences
+        year_match = re.search(r'(?:20|19)(\d{2})', message)
+        if year_match:
+            preferences['min_year'] = int(year_match.group(0))
+        
+        # Extract make preferences
+        car_makes = ['audi', 'bmw', 'mercedes', 'volkswagen', 'ford', 'toyota', 'honda', 'nissan', 'hyundai', 'kia', 'mazda', 'renault', 'peugeot', 'citroen', 'fiat', 'skoda', 'seat', 'volvo', 'jaguar', 'land rover', 'mini', 'lexus']
+        found_makes = [make for make in car_makes if make in message_lower]
+        if found_makes:
+            preferences['preferred_makes'] = found_makes
+        
+        # Extract fuel type
+        if 'diesel' in message_lower:
+            preferences['fuel_type'] = 'diesel'
+        elif 'petrol' in message_lower:
+            preferences['fuel_type'] = 'petrol'
+        elif 'hybrid' in message_lower:
+            preferences['fuel_type'] = 'hybrid'
+        elif 'electric' in message_lower:
+            preferences['fuel_type'] = 'electric'
+        
+        if preferences:
+            await update_customer_preferences(user_id, phone_number, preferences)
+            
+    except Exception as e:
+        print(f"Error extracting preferences: {e}")
 
 @app.post("/whatsapp")
 async def whatsapp_webhook(request: Request):
@@ -251,9 +515,9 @@ async def whatsapp_webhook(request: Request):
         # Add message to history
         await add_to_message_history(user_id, msg_body, True)
         
-        # Get AI feedback
+        # Get Sean's response
         start_time = time.time()
-        ai_response = await get_ai_feedback(msg_body, user_id=user_id, start_time=start_time)
+        ai_response = await get_sean_response(msg_body, user_id, user_id, start_time=start_time)
         
         # Add AI response to history
         await add_to_message_history(user_id, ai_response, False)
@@ -266,6 +530,60 @@ async def whatsapp_webhook(request: Request):
     except Exception as e:
         print(f"Error in webhook: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/scrape-inventory")
+async def manual_inventory_scrape():
+    """Manual endpoint to trigger inventory scraping"""
+    try:
+        cars = await scrape_brendan_conlon_inventory()
+        return {"success": True, "cars_scraped": len(cars)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/inventory")
+async def get_current_inventory():
+    """Get current inventory from database"""
+    try:
+        cursor = car_listings.find({"available": True}).sort("price", 1)
+        cars = await cursor.to_list(length=100)
+        return {"success": True, "inventory": cars}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/customer-preferences/{user_id}")
+async def get_customer_prefs(user_id: str):
+    """Get customer preferences"""
+    try:
+        prefs = await get_customer_preferences(user_id)
+        return {"success": True, "preferences": prefs}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# Background task to periodically scrape inventory
+async def periodic_inventory_scrape():
+    """Scrape inventory every 6 hours"""
+    while True:
+        try:
+            print("Starting scheduled inventory scrape...")
+            await scrape_brendan_conlon_inventory()
+            print("Inventory scrape completed")
+        except Exception as e:
+            print(f"Error in scheduled scrape: {e}")
+        
+        # Wait 6 hours
+        await asyncio.sleep(6 * 60 * 60)
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks"""
+    # Initial inventory scrape
+    try:
+        await scrape_brendan_conlon_inventory()
+    except Exception as e:
+        print(f"Initial inventory scrape failed: {e}")
+    
+    # Start periodic scraping
+    asyncio.create_task(periodic_inventory_scrape())
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
